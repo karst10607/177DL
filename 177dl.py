@@ -1,127 +1,182 @@
-#!/usr/local/bin/python3.4
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-__author__ = 'wudaown'
-
-#
-#   应朋友要求做了一个脚本从 www.177pic.info/ 下载所有中文漫画
-#   已经挂服务器上面慢慢跑了，没有上面用处，一次性的东西
-#
 
 import requests
 from bs4 import BeautifulSoup
-from io import BytesIO
 import os
+import re
+from urllib.parse import urljoin, urlparse
 
+class ComicDownloader:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Referer': 'https://www.177picyy.com/'
+        })
+        self.base_url = 'https://www.177picyy.com'
 
-def getSource(url):     # 读取完整页面 返回一个漫画名称和下载地址的mapping
-    r = requests.get(url)
-    soup = BeautifulSoup(r.text,'lxml')
-    link = soup.find_all('h2')  # bs4 找 h2 tag
-    dl = []
-    title = []
-    for x in link:
-        title.append(x.contents[0]['title'][13:]) # h2 tag 下还有其他tag读取内容
-        dl.append(x.contents[0]['href'])
-    comic = dict(zip(dl,title))
-    return(comic)
+    def get_comic_info(self, url):
+        """Get comic title and image URLs from a comic page"""
+        try:
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'lxml')
+            
+            # Get comic title
+            title_tag = soup.find('h1', class_='entry-title')
+            if not title_tag:
+                title_tag = soup.find('h1')
+            title = title_tag.get_text(strip=True) if title_tag else 'Unknown_Comic'
+            
+            # Clean up title to make it filesystem-safe
+            title = re.sub(r'[\\/*?:"<>|]', '', title).strip()
+            
+            # Find all image tags
+            images = []
+            for img in soup.find_all('img'):
+                src = img.get('src', '')
+                if '177picyy.com' in src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+                    images.append(src)
+            
+            # If no images found with src, try data-src or other attributes
+            if not images:
+                for img in soup.find_all('img'):
+                    for attr in ['data-src', 'data-lazy-src']:
+                        src = img.get(attr, '')
+                        if '177picyy.com' in src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+                            images.append(src)
+                            
+            # Get all pages in order
+            all_pages = [url]  # Start with the current page
+            
+            # Find pagination links
+            pagination = soup.find('div', class_='pagination')
+            if pagination:
+                # Extract all page numbers and sort them
+                page_links = []
+                for a in pagination.find_all('a', href=True):
+                    try:
+                        # Try to extract page number from URL
+                        page_num = int(a['href'].rstrip('/').split('/')[-1])
+                        page_links.append((page_num, a['href']))
+                    except (ValueError, IndexError):
+                        continue
+                
+                # Sort by page number and add to all_pages
+                for num, link in sorted(page_links, key=lambda x: x[0]):
+                    if link not in all_pages:  # Avoid duplicates
+                        all_pages.append(link)
+            
+            # Process all pages in order
+            for page_url in all_pages:
+                try:
+                    if page_url != url:  # Skip current page as it's already processed
+                        page_response = self.session.get(page_url, timeout=10)
+                        page_soup = BeautifulSoup(page_response.text, 'lxml')
+                    else:
+                        page_soup = soup  # Use already parsed soup for current page
+                        
+                    # Find images on the page
+                    page_images = []
+                    for img in page_soup.find_all('img'):
+                        src = img.get('src', '')
+                        if '177picyy.com' in src and any(ext in src.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+                            page_images.append(src)
+                    
+                    # Maintain order by extending with current page's images
+                    images.extend(page_images)
+                    
+                except Exception as e:
+                    print(f"Error processing page {page_url}: {str(e)}")
+            
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_images = []
+            for img in images:
+                if img not in seen:
+                    seen.add(img)
+                    unique_images.append(img)
+            
+            return {
+                'title': title,
+                'images': unique_images  # Return ordered, unique images
+            }
+            
+        except Exception as e:
+            print(f"Error getting comic info: {str(e)}")
+            return None
 
-def getPageNumber(page_url):    # 通过下载地址判断一共有多少页
-    allPage = []
-    p = requests.get(page_url)
-    pagesoup = BeautifulSoup(p.text,'lxml')
-    page = pagesoup.find(attrs={'class':'wp-pagenavi'}) # 直接查找attrs判断页面
-    if page == None:    # 如果page值为空则返回默认页面
-        number_of_page = 0
-        allPage.append(page_url)
-        return allPage
-    else:
-        number_of_page = int(page.contents[0].contents[-3].string)  # page不为空时返回多少页面
-        for i in range(number_of_page):
-            allPage.append(page_url+'/'+str(i+1))
-        return allPage
+    def download_images(self, image_urls, output_dir):
+        """Download images to the specified directory"""
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+        
+        downloaded = 0
+        for i, img_url in enumerate(image_urls, 1):
+            try:
+                # Get the image filename from the URL
+                img_name = os.path.basename(urlparse(img_url).path)
+                if not img_name:
+                    img_name = f"image_{i:03d}.jpg"
+                
+                img_path = os.path.join(output_dir, img_name)
+                
+                # Skip if already downloaded
+                if os.path.exists(img_path):
+                    print(f"Skipping {img_name} - already exists")
+                    continue
+                
+                print(f"Downloading {img_name}...")
+                response = self.session.get(img_url, stream=True, timeout=30)
+                response.raise_for_status()
+                
+                with open(img_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                downloaded += 1
+                print(f"Downloaded {img_name} successfully!")
+                
+            except Exception as e:
+                print(f"Error downloading {img_url}: {str(e)}")
+        
+        return downloaded
 
+def main():
+    import sys
+    
+    if len(sys.argv) < 2:
+        print("Usage: python3 177dl.py <comic_url> [output_directory]")
+        print("Example: python3 177dl.py https://www.177picyy.com/html/2025/06/7333200.html/2/ my_comics")
+        return
+    
+    comic_url = sys.argv[1]
+    output_dir = sys.argv[2] if len(sys.argv) > 2 else 'downloaded_comics'
+    
+    downloader = ComicDownloader()
+    
+    print(f"Fetching comic info from: {comic_url}")
+    comic_info = downloader.get_comic_info(comic_url)
+    
+    if not comic_info or not comic_info['images']:
+        print("No comic information or images found!")
+        return
+    
+    print(f"\nComic Title: {comic_info['title']}")
+    print(f"Found {len(comic_info['images'])} unique images")
+    
+    # Create a safe directory name from the comic title
+    safe_title = re.sub(r'[\\/*?:"<>|]', '', comic_info['title']).strip()
+    comic_dir = os.path.join(output_dir, safe_title)
+    
+    print(f"\nDownloading to: {os.path.abspath(comic_dir)}")
+    
+    # Download all images
+    downloaded = downloader.download_images(comic_info['images'], comic_dir)
+    
+    print(f"\nDownload complete! {downloaded} images downloaded to {comic_dir}")
 
-def getImglink(page):       # 去的图片直链
-    imgdr = []
-    p = requests.get(page)
-    imgsoup = BeautifulSoup(p.text,'lxml')
-    imglink = imgsoup.findAll('img')    # 找html中所有图片
-    for y in imglink:
-        if 'alt' in y.attrs:        # 剔除没有编号的图片
-            imgdr.append(y['src'])
-    return  imgdr
-
-
-
-def downloadComic(comic_link):      # 下载图片
-    imglist = []
-    comic_page = getPageNumber(comic_link)
-    for x in comic_page:
-        tmp = getImglink(x)
-        for y in tmp:
-            imglist.append(y)
-    for z in range(len(imglist)):      # 用range是因为要重命名图片为后面打包做准备
-        img = requests.get(imglist[z-1])
-        with open(format(z,'03')+'.jpg', 'wb') as f: # 图片wb模式写入 binary
-            f.write(img.content)
-    os.chdir('..')
-
-def getSourcePageNumber():
-    source = requests.get('http://www.177pic.info/html/category/tt/page/1')
-    sourcesoup = BeautifulSoup(source.text,'lxml')
-    sourcepage = sourcesoup.find(attrs={'class':'wp-pagenavi'})
-    source_page_number = int(sourcepage.contents[-2]['href'].split('/')[-1])
-    return source_page_number
-
-
-def main(): # main 模块
-    if os.path.exists('recode') == False:
-        print('第一次运行，建立页面记录')
-        os.popen('touch recode')    # 判断是否首次执行脚本
-        with open ('recode','w') as f:
-            f.write('http://www.177pic.info/html/category/tt/page/1')
-    else:
-        print('读取上次停止下载页面')
-        with open('recode','r') as f:
-            trecode = f.readline()  # 读取记录
-            recode = trecode.split('/')
-            print('上次停止在第{0}页'.format(recode))
-    url = 'http://www.177pic.info/html/category/tt'
-    total_page = getSourcePageNumber()
-    url_list = []
-    for i in range(int(recode[-1]), total_page):    # 根据记录选择开始页面
-        url_list.append(url+'/page/'+str(i+1))
-    tmp = os.popen('ls').readlines()
-    allcomic = []
-    for i in tmp:
-        allcomic.append(i[:-1]) # 读取目录列表，保存以便判断漫画是否下载
-    del tmp
-    for y in url_list:
-        print('正在下载: ',y)
-        with open('recode','w') as f:
-            f.write(y)
-        comic = getSource(y)
-        for x in comic:
-            # print(comic[x],end=' ')
-            # print((comic[x]+'.cbr'  in allcomic))
-            if ((comic[x]+'.cbr') in allcomic) == True:
-                print(comic[x],'已经存在。')
-            else:
-                print('正在下载: ',comic[x])
-                if (os.path.exists(comic[x])) == True:
-                    print('目录已经存在。')
-                    os.chdir(comic[x])
-                    downloadComic(x)
-                    command = 'rar a -r -s -m5 -df \''+comic[x]+'.cbr\' \''+comic[x]+'\''
-                    os.system(command)
-                    os.system('clear')
-                else:
-                    os.mkdir(comic[x])
-                    os.chdir(comic[x])
-                    downloadComic(x)
-                    command = 'rar a -r -s -m5 -df \''+comic[x]+'.cbr\' \''+comic[x]+'\''
-                    os.system(command)
-                    os.system('clear')
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
